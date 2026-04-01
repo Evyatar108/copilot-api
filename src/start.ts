@@ -3,12 +3,12 @@
 import { defineCommand } from "citty"
 import clipboard from "clipboardy"
 import consola from "consola"
-import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
 import { mergeConfigWithDefaults } from "./lib/config"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
+import { getConfiguredApiKeys } from "./lib/request-auth"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
@@ -18,6 +18,40 @@ import {
   cacheVSCodeVersion,
   cacheVsCodeSessionId,
 } from "./lib/utils"
+import {
+  onWebSocketClose,
+  onWebSocketMessage,
+  onWebSocketOpen,
+  type WebSocketProxyData,
+} from "./routes/responses/websocket-proxy"
+
+const isWebSocketUpgradeRequest = (req: Request): boolean => {
+  const url = new URL(req.url)
+  const path = url.pathname
+  if (path !== "/v1/responses" && path !== "/responses") return false
+  return req.headers.get("upgrade")?.toLowerCase() === "websocket"
+}
+
+const checkWebSocketAuth = (req: Request): boolean => {
+  const apiKeys = getConfiguredApiKeys()
+  if (apiKeys.length === 0) return true
+
+  // Check x-api-key header
+  const xApiKey = req.headers.get("x-api-key")?.trim()
+  if (xApiKey && apiKeys.includes(xApiKey)) return true
+
+  // Check Authorization: Bearer <token>
+  const authorization = req.headers.get("authorization")
+  if (authorization) {
+    const [scheme, ...rest] = authorization.trim().split(/\s+/)
+    if (scheme.toLowerCase() === "bearer") {
+      const bearerToken = rest.join(" ").trim()
+      if (bearerToken && apiKeys.includes(bearerToken)) return true
+    }
+  }
+
+  return false
+}
 
 interface RunServerOptions {
   port: number
@@ -131,13 +165,57 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     `🌐 Usage Viewer: ${serverUrl}/usage-viewer?endpoint=${serverUrl}/usage`,
   )
 
+  await startHttpServer(options.port)
+}
+
+async function startHttpServer(port: number): Promise<void> {
   const { server } = await import("./server")
 
-  serve({
-    fetch: server.fetch as ServerHandler,
-    port: options.port,
-    bun: {
-      idleTimeout: 0,
+  // E2E WebSocket: accept WS from Codex, open upstream WS to GitHub Copilot,
+  // forward messages bidirectionally. Upstream WS bypasses the HTTP proxy
+  // (Bun's WebSocket client doesn't support HTTP CONNECT tunneling).
+  Bun.serve<WebSocketProxyData, Record<string, never>>({
+    port,
+    idleTimeout: 0,
+    fetch(req, bunServer) {
+      if (isWebSocketUpgradeRequest(req)) {
+        if (!checkWebSocketAuth(req)) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: "Unauthorized",
+                type: "authentication_error",
+              },
+            }),
+            { status: 401, headers: { "Content-Type": "application/json" } },
+          )
+        }
+
+        const upgraded = bunServer.upgrade<WebSocketProxyData>(req, {
+          data: {
+            upstream: null,
+            upstreamReady: false,
+            pendingMessages: [],
+            closing: false,
+          },
+        })
+        if (upgraded) return undefined
+        return new Response("WebSocket upgrade failed", { status: 500 })
+      }
+
+      return server.fetch(req)
+    },
+    websocket: {
+      perMessageDeflate: true,
+      open(ws) {
+        onWebSocketOpen(ws)
+      },
+      message(ws, message) {
+        onWebSocketMessage(ws, message)
+      },
+      close(ws, code, reason) {
+        onWebSocketClose(ws, code, reason)
+      },
     },
   })
 }

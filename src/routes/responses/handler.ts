@@ -31,12 +31,33 @@ export const handleResponses = async (c: Context) => {
   const payload = await c.req.json<ResponsesPayload>()
   logger.debug("Responses request payload:", JSON.stringify(payload))
 
+  // Warmup/probe requests may have empty or missing `input`. The upstream API
+  // requires a non-empty input or previous_response_id, so return a synthetic
+  // empty response instead of forwarding.
+  const hasInput = Array.isArray(payload.input) ? payload.input.length > 0 : Boolean(payload.input)
+  const hasPrevResponse = Boolean((payload as Record<string, unknown>).previous_response_id)
+  if (!hasInput && !hasPrevResponse) {
+    logger.debug("Probe request (no/empty input), returning empty response")
+    return c.json({
+      id: `resp_probe_${Date.now()}`,
+      object: "response",
+      status: "completed",
+      output: [],
+      output_text: "",
+      model: payload.model || "unknown",
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    })
+  }
+
   // not support subagent marker for now , set sessionId = getUUID(requestId)
   const requestId = generateRequestIdFromPayload({ messages: payload.input })
   logger.debug("Generated request ID:", requestId)
 
   const sessionId = getUUID(requestId)
   logger.debug("Extracted session ID:", sessionId)
+
+  // GitHub Copilot doesn't support previous_response_id — strip it
+  delete (payload as Record<string, unknown>).previous_response_id
 
   useFunctionApplyPatch(payload)
 

@@ -393,8 +393,9 @@ export const createResponses = async (
   })
 
   if (!response.ok) {
-    consola.error("Failed to create responses", response)
-    throw new HTTPError("Failed to create responses", response)
+    const errorBody = await response.text().catch(() => "(could not read body)")
+    consola.error(`Failed to create responses [${response.status}]:`, errorBody)
+    throw new HTTPError(`Failed to create responses: ${errorBody}`, response)
   }
 
   if (payload.stream) {
